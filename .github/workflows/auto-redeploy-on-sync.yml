@@ -2,15 +2,18 @@ name: Auto redeploy on Sync fork
 
 # 目标：在 GitHub 上点一次 "Sync fork"，几分钟内服务器自动部署到位，不需要再点第二次。
 #
-# 为什么不能直接用 on: push —— GitHub 明确规定：提交信息含 [skip ci] / [no ci] /
-# [skip actions] 时，push 与 pull_request 触发的工作流"不会启动"。上游的 release 提交
-# 恰好写成 `chore: release v2.9.0 [skip ci]`，所以点 Sync fork 之后：
-#   · 不会产生任何 push 事件 → 本仓库的 Actions 安静无事
-#   · Cloudflare 侧也可能因此没有发起构建（线上 build 停在旧提交）
-# 由于这条链路在"事件"层面就已经断了，唯一可靠的做法是轮询比对：
+# 实测结论（用 commit 上的 Workers Builds check run 逐条核对过）：
+#   · 提交信息含跳过标记（如 chore: release v2.9.0 后面那串方括号标记）时，
+#     Cloudflare 的 check run 结论是 skipped，不会构建 → 线上 build 停在旧提交
+#   · 同一个提交如果没有该标记，则正常 success 并部署
+#   · GitHub Actions 的 on: push 同样会被该标记跳过，所以 Sync fork 之后连一个
+#     workflow run 都不会产生
+# 也就是说：点 Sync fork 这个动作，在"事件"层面就被静默丢弃了，只能靠轮询兜住。
 #   线上 /api/health 的 build  ≠  fork HEAD  →  主动补一次部署
 #
-# 补部署有两条通道，优先用 Deploy Hook（不产生提交），没有配置则推空提交（官方兜底做法）。
+# 补部署通道，按优先级：
+#   1. Deploy Hook（仓库 Secret EDGE_EVER_CLOUDFLARE_DEPLOY_HOOK_URL）—— 不产生提交
+#   2. 推空提交（官方兜底做法，已验证可触发构建）—— 默认开启，可用仓库变量关闭
 
 on:
   schedule:
@@ -43,9 +46,9 @@ jobs:
     env:
       HEALTH_URL: ${{ vars.EDGE_EVER_HEALTH_URL || 'https://20292030.xyz/api/health' }}
       DEPLOY_HOOK: ${{ secrets.EDGE_EVER_CLOUDFLARE_DEPLOY_HOOK_URL }}
-      # 空提交兜底默认关闭：实测推普通提交未必会让 Cloudflare 构建，
-      # 贸然推送只会在历史上留下无用提交。确认有效后再设为 true。
-      ALLOW_COMMIT_FALLBACK: ${{ vars.EDGE_EVER_ALLOW_COMMIT_FALLBACK || 'false' }}
+      # 空提交兜底：已验证有效（提交信息里不能出现跳过标记，否则 Cloudflare 会 skipped）。
+      # 配了 Deploy Hook 就走 Hook（不产生提交），没配才走这条。
+      ALLOW_COMMIT_FALLBACK: ${{ vars.EDGE_EVER_ALLOW_COMMIT_FALLBACK || 'true' }}
       FORCE: ${{ github.event.inputs.force || 'false' }}
       MARKER: "chore: auto-redeploy"
 
@@ -145,9 +148,7 @@ jobs:
             TARGET=$(git rev-parse HEAD)
           else
             # 既不建提交、也不静默放过：明确报错并给出修复动作。
-            # 实测推普通提交并不会让 Cloudflare 构建（Git 触发通道可能已失效），
-            # 因此在没有独立通道（Deploy Hook）时，补部署是不成立的。
-            echo "::error::检测到漂移（线上 ${LIVE} ≠ HEAD ${HEAD_SHA:0:7}），但没有可用的补部署通道。请在仓库 Secrets 配置 EDGE_EVER_CLOUDFLARE_DEPLOY_HOOK_URL（Cloudflare → Workers & Pages → 你的 Worker → Settings → Builds → Deploy Hooks）。"
+            echo "::error::检测到漂移（线上 ${LIVE} ≠ HEAD ${HEAD_SHA:0:7}），但没有可用的补部署通道。请配置 EDGE_EVER_CLOUDFLARE_DEPLOY_HOOK_URL，或把仓库变量 EDGE_EVER_ALLOW_COMMIT_FALLBACK 设为 true 允许推空提交。"
             exit 1
           fi
 
