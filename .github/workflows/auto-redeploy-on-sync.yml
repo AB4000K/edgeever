@@ -1,0 +1,158 @@
+name: Auto redeploy on Sync fork
+
+# 目标：在 GitHub 上点一次 "Sync fork"，几分钟内服务器自动部署到位，不需要再点第二次。
+#
+# 为什么不能直接用 on: push —— GitHub 明确规定：提交信息含 [skip ci] / [no ci] /
+# [skip actions] 时，push 与 pull_request 触发的工作流"不会启动"。上游的 release 提交
+# 恰好写成 `chore: release v2.9.0 [skip ci]`，所以点 Sync fork 之后：
+#   · 不会产生任何 push 事件 → 本仓库的 Actions 安静无事
+#   · Cloudflare 侧也可能因此没有发起构建（线上 build 停在旧提交）
+# 由于这条链路在"事件"层面就已经断了，唯一可靠的做法是轮询比对：
+#   线上 /api/health 的 build  ≠  fork HEAD  →  主动补一次部署
+#
+# 补部署有两条通道，优先用 Deploy Hook（不产生提交），没有配置则推空提交（官方兜底做法）。
+
+on:
+  schedule:
+    # GitHub 允许的最小粒度是 5 分钟；实际触发常被延迟到 5-15 分钟，属正常现象。
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "强制补一次部署（用于验证链路是否打通）"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: edgeever-fork-drift
+  cancel-in-progress: false
+
+jobs:
+  ensure-deployed:
+    # 上游仓库自己不需要这个看门狗
+    if: github.repository != 'tianma-if/edgeever'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      HEALTH_URL: ${{ vars.EDGE_EVER_HEALTH_URL || 'https://20292030.xyz/api/health' }}
+      DEPLOY_HOOK: ${{ secrets.EDGE_EVER_CLOUDFLARE_DEPLOY_HOOK_URL }}
+      FORCE: ${{ github.event.inputs.force || 'false' }}
+      MARKER: "chore: auto-redeploy"
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          # 需要完整历史来数「之前触发过几次补部署」，避免死循环
+          fetch-depth: 0
+
+      - name: 比对线上 build 与 fork HEAD，必要时补部署
+        run: |
+          set -uo pipefail
+
+          read_live() {
+            local out
+            out=$(curl -fsS --max-time 15 "${HEALTH_URL}" 2>/dev/null) || { printf ''; return; }
+            printf '%s' "$out" | jq -r '.build // empty' 2>/dev/null
+          }
+
+          # $1=fork HEAD 完整 sha  $2=线上 build
+          in_sync() {
+            local head="$1" live="$2"
+            [ -n "$live" ] || return 1
+            # 线上 build 必须是十六进制 sha 前缀，否则（例如 "development"）不参与比较
+            case "$live" in *[!0-9a-fA-F]*) return 1 ;; esac
+            [ "${#live}" -ge 7 ] || return 1
+            case "$head" in "$live"*) return 0 ;; esac
+            return 1
+          }
+
+          HEAD_SHA=$(git rev-parse HEAD)
+          LIVE=$(read_live)
+
+          echo "fork HEAD : ${HEAD_SHA}"
+          echo "线上 build: ${LIVE:-<读不到>}"
+          echo "force     : ${FORCE}"
+
+          if in_sync "$HEAD_SHA" "$LIVE" && [ "${FORCE}" != "true" ]; then
+            echo "::notice::已同步（build ${LIVE} = HEAD ${HEAD_SHA:0:7}），无需动作"
+            exit 0
+          fi
+
+          # 读不到、或 build 不是 sha（例如 "development"）时无法比对，宁可不动作也不要乱推提交
+          if [ "${FORCE}" != "true" ]; then
+            if [ -z "$LIVE" ]; then
+              echo "::warning::读不到线上 build（${HEALTH_URL}），本轮不动作"
+              exit 0
+            fi
+            case "$LIVE" in
+              *[!0-9a-fA-F]*)
+                echo "::warning::线上 build 不是 sha（${LIVE}），无法比对，本轮不动作"
+                exit 0
+                ;;
+            esac
+          fi
+
+          # 漂移。先给在途构建留 2 分钟窗口：刚 push 完就轮询到时，CF 可能正在构建。
+          if [ "${FORCE}" != "true" ]; then
+            for _ in 1 2 3 4 5 6; do
+              sleep 20
+              LIVE=$(read_live)
+              if in_sync "$HEAD_SHA" "$LIVE"; then
+                echo "::notice::在途构建已落地（build ${LIVE}），无需补部署"
+                exit 0
+              fi
+            done
+            echo "::warning::等待 2 分钟后仍漂移：线上 build=${LIVE:-<空>}，HEAD=${HEAD_SHA:0:7}"
+          fi
+
+          # 防死循环：最近 30 个提交里补过太多次仍未生效，说明是构建本身失败，停止自动重试
+          COUNT=$(git log -30 --format='%s' | grep -c "^${MARKER}" || true)
+          LAST_TS=$(git log -30 --format='%ct|%s' | awk -F'|' -v m="${MARKER}" 'index($2,m)==1{print $1; exit}')
+          NOW=$(date +%s)
+
+          if [ "${COUNT}" -ge 3 ]; then
+            echo "::error::最近 30 个提交中已有 ${COUNT} 次自动补部署仍未生效，疑似 Cloudflare 构建失败，请人工查看构建日志"
+            exit 1
+          fi
+
+          if [ "${FORCE}" != "true" ] && [ -n "${LAST_TS:-}" ] && [ $((NOW - LAST_TS)) -lt 1200 ]; then
+            echo "::notice::20 分钟内刚触发过补部署（可能仍在构建），本轮跳过"
+            exit 0
+          fi
+
+          # 执行补部署
+          if [ -n "${DEPLOY_HOOK:-}" ]; then
+            echo "使用 Cloudflare Deploy Hook 触发重建"
+            curl -fsS -X POST "${DEPLOY_HOOK}" >/dev/null
+            TARGET="$HEAD_SHA"
+          else
+            echo "未配置 Deploy Hook，改为推一个空提交（官方兜底做法，提交信息不含 skip ci）"
+            git config user.name  "edgeever-auto-redeploy[bot]"
+            git config user.email "edgeever-auto-redeploy[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "${MARKER}: live=${LIVE:-none} head=${HEAD_SHA:0:7}"
+            git push origin HEAD:main
+            TARGET=$(git rev-parse HEAD)
+          fi
+
+          echo "已触发，目标提交 ${TARGET}"
+
+          # 确认落地，最多等 8 分钟
+          for _ in $(seq 1 24); do
+            sleep 20
+            LIVE=$(read_live)
+            if in_sync "$TARGET" "$LIVE"; then
+              echo "::notice::部署完成，线上 build=${LIVE}"
+              exit 0
+            fi
+          done
+
+          echo "::error::触发后 8 分钟仍未检测到新构建落地（线上 build=${LIVE:-<空>}），请查看 Cloudflare 构建历史"
+          exit 1
