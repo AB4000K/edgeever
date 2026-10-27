@@ -43,6 +43,9 @@ jobs:
     env:
       HEALTH_URL: ${{ vars.EDGE_EVER_HEALTH_URL || 'https://20292030.xyz/api/health' }}
       DEPLOY_HOOK: ${{ secrets.EDGE_EVER_CLOUDFLARE_DEPLOY_HOOK_URL }}
+      # 空提交兜底默认关闭：实测推普通提交未必会让 Cloudflare 构建，
+      # 贸然推送只会在历史上留下无用提交。确认有效后再设为 true。
+      ALLOW_COMMIT_FALLBACK: ${{ vars.EDGE_EVER_ALLOW_COMMIT_FALLBACK || 'false' }}
       FORCE: ${{ github.event.inputs.force || 'false' }}
       MARKER: "chore: auto-redeploy"
 
@@ -133,13 +136,19 @@ jobs:
             echo "使用 Cloudflare Deploy Hook 触发重建"
             curl -fsS -X POST "${DEPLOY_HOOK}" >/dev/null
             TARGET="$HEAD_SHA"
-          else
-            echo "未配置 Deploy Hook，改为推一个空提交（官方兜底做法，提交信息不含 skip ci）"
+          elif [ "${ALLOW_COMMIT_FALLBACK:-false}" = "true" ]; then
+            echo "未配置 Deploy Hook，按 ALLOW_COMMIT_FALLBACK 走空提交兜底"
             git config user.name  "edgeever-auto-redeploy[bot]"
             git config user.email "edgeever-auto-redeploy[bot]@users.noreply.github.com"
             git commit --allow-empty -m "${MARKER}: live=${LIVE:-none} head=${HEAD_SHA:0:7}"
             git push origin HEAD:main
             TARGET=$(git rev-parse HEAD)
+          else
+            # 既不建提交、也不静默放过：明确报错并给出修复动作。
+            # 实测推普通提交并不会让 Cloudflare 构建（Git 触发通道可能已失效），
+            # 因此在没有独立通道（Deploy Hook）时，补部署是不成立的。
+            echo "::error::检测到漂移（线上 ${LIVE} ≠ HEAD ${HEAD_SHA:0:7}），但没有可用的补部署通道。请在仓库 Secrets 配置 EDGE_EVER_CLOUDFLARE_DEPLOY_HOOK_URL（Cloudflare → Workers & Pages → 你的 Worker → Settings → Builds → Deploy Hooks）。"
+            exit 1
           fi
 
           echo "已触发，目标提交 ${TARGET}"
