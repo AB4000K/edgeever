@@ -7,9 +7,11 @@ name: Update deployed EdgeEver
 
 on:
   schedule:
-    # Fork-local tweak: poll every 30 minutes so upstream Releases land quickly.
-    # Scheduled checks are a no-op when the Fork is already aligned.
+    # Fork-local tweak. GitHub throttles scheduled runs on forks (observed 4-7h
+    # gaps even for */5 crons), so register two independent cron entries to raise
+    # the odds of a timely run. A scheduled run is a no-op when already aligned.
     - cron: "*/30 * * * *"
+    - cron: "11,41 * * * *"
   workflow_dispatch:
     inputs:
       channel:
